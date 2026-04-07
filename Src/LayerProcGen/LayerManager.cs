@@ -60,7 +60,8 @@ namespace Runevision.LayerProcGen {
 		}
 
 		public void Unload() {
-			layerUpdateThread.Abort();
+			aborting = true;
+			layerUpdateThread.Join();
 			do {
 				lock (topDependencies) {
 					for (int i = 0; i < topDependencies.Count; i++) {
