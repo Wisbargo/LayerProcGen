@@ -118,12 +118,14 @@ namespace Runevision.LayerProcGen {
 
 					if (SimpleProfiler.AnyCurrent())
 						SimpleProfiler.Log();
-					lock (PoolManager.allPools) {
-						var sorted = PoolManager.allPools.OrderBy(e => e.ToString());
-						foreach (IPool pool in sorted) {
-							Console.WriteLine("Pool {0} {1,6} capacity ({2,6} active, {3,6} inactive)",
-								pool.ToString().PadRight(50, '.'),
-								pool.CountAll, pool.CountActive, pool.CountInactive);
+					if (Logg.ConsoleEnabled) {
+						lock (PoolManager.allPools) {
+							var sorted = PoolManager.allPools.OrderBy(e => e.ToString());
+							foreach (IPool pool in sorted) {
+								Console.WriteLine("Pool {0} {1,6} capacity ({2,6} active, {3,6} inactive)",
+									pool.ToString().PadRight(50, '.'),
+									pool.CountAll, pool.CountActive, pool.CountInactive);
+							}
 						}
 					}
 				}

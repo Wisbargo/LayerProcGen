@@ -166,7 +166,8 @@ namespace Runevision.Common {
 			);
 			lock (dict) {
 				LogRecursive(logString, root, -1);
-				Console.WriteLine(logString.ToString());
+				if (Logg.ConsoleEnabled)
+					Console.WriteLine(logString.ToString());
 				foreach (var info in dict.Values) {
 					ProfilerInfo infoCopy = info;
 					ObjectPool<ProfilerInfo>.GlobalReturn(ref infoCopy);

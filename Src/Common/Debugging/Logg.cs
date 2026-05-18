@@ -22,6 +22,9 @@ namespace Runevision.Common {
 		public static event Action<string> ForwardWarning;
 		public static event Action<string> ForwardError;
 
+		/// <summary>Set to false to suppress all console output from LayerProcGen.</summary>
+		public static bool ConsoleEnabled = true;
+
 		static DateTime s_StartTime;
 
 		static Logg() {
@@ -29,18 +32,21 @@ namespace Runevision.Common {
 		}
 
 		public static void Log(string str, bool showInConsole = true) {
-			Console.WriteLine((DateTime.Now - s_StartTime) + "   " + str);
+			if (ConsoleEnabled)
+				Console.WriteLine((DateTime.Now - s_StartTime) + "   " + str);
 			if (showInConsole)
 				ForwardMessage?.Invoke((DateTime.Now - s_StartTime) + "   " + str);
 		}
 
 		public static void LogWarning(string str) {
-			Console.WriteLine((DateTime.Now - s_StartTime) + "   Warning: " + str);
+			if (ConsoleEnabled)
+				Console.WriteLine((DateTime.Now - s_StartTime) + "   Warning: " + str);
 			ForwardWarning?.Invoke((DateTime.Now - s_StartTime) + "   " + str);
 		}
 
 		public static void LogError(string str) {
-			Console.WriteLine((DateTime.Now - s_StartTime) + "   Error: " + str);
+			if (ConsoleEnabled)
+				Console.WriteLine((DateTime.Now - s_StartTime) + "   Error: " + str);
 			ForwardError?.Invoke((DateTime.Now - s_StartTime) + "   " + str);
 		}
 	}
