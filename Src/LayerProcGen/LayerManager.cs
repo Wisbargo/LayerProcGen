@@ -24,6 +24,11 @@ namespace Runevision.LayerProcGen {
 		public bool useParallelThreads { get; private set; }
 		public bool isGeneratingInBackground { get; private set; }
 		public bool building { get { return isGeneratingInBackground || !MainThreadActionQueue.idle; } }
+		// Monotonically increases after a top-level dependency request has been
+		// completely processed. Consumers can use this to stage large requests
+		// without guessing whether the background worker has observed a change.
+		int completedGenerationPasses;
+		public int CompletedGenerationPasses { get { return Volatile.Read(ref completedGenerationPasses); } }
 
 		public event Action abort;
 		public bool aborting { get; private set; }
@@ -59,17 +64,38 @@ namespace Runevision.LayerProcGen {
 			Logg.LogError($"Thread: {e.Message}\n{e.StackTrace}");
 		}
 
+		/// <summary>How long Unload waits for in-flight generation before abandoning it.</summary>
+		public static int unloadTimeoutMs = 5000;
+
 		public void Unload() {
 			aborting = true;
-			layerUpdateThread.Join();
-			do {
+
+			// Bounded shutdown. This used to be an unbounded Join followed by a tight
+			// do/while (building) spin: the Unity coroutine's "yield return null" was dropped
+			// when this was ported, so it also burned a core while waiting. That stayed
+			// harmless as long as generation drained in a few seconds (the legacy heightmap
+			// path did), but with 3D density terrain it does not drain and Ctrl+C looked like
+			// a hang -- the process kept running with the shutdown callback stuck here.
+			// Callers should cancel outstanding generation before calling this; the timeout is
+			// the backstop for when they cannot.
+			if (!layerUpdateThread.Join(unloadTimeoutMs))
+				Logg.LogWarning($"LayerManager.Unload: layer update thread did not stop within {unloadTimeoutMs}ms; abandoning it.");
+
+			long deadline = Environment.TickCount64 + unloadTimeoutMs;
+			while (true) {
 				lock (topDependencies) {
 					for (int i = 0; i < topDependencies.Count; i++) {
 						topDependencies[i].isActive = false;
 					}
 				}
-				//yield return null;
-			} while (building);
+				if (!building)
+					break;
+				if (Environment.TickCount64 >= deadline) {
+					Logg.LogWarning($"LayerManager.Unload: generation still in flight after {unloadTimeoutMs}ms; abandoning it.");
+					break;
+				}
+				Thread.Sleep(1);
+			}
 
 			AbstractDataLayer.ResetInstances();
 			instance = null;
@@ -115,6 +141,7 @@ namespace Runevision.LayerProcGen {
 					}
 
 					SimpleProfiler.End(ph);
+					Interlocked.Increment(ref completedGenerationPasses);
 
 					if (SimpleProfiler.AnyCurrent())
 						SimpleProfiler.Log();
