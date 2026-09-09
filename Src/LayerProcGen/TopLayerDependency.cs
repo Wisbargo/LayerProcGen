@@ -22,6 +22,10 @@ namespace Runevision.LayerProcGen {
 		public Point size { get; private set; }
 		public GridBounds chunkIndices { get; private set; }
 		public bool changed { get; private set; }
+		// A focus update can arrive while LayerManager is generating the prior bounds.
+		// The worker captures this value before starting and stops its now-obsolete
+		// request as soon as a chunk job reaches a cancellation check.
+		int generationRevision;
 
 		internal ChunkLevelData currentRootUsage;
 
@@ -33,6 +37,7 @@ namespace Runevision.LayerProcGen {
 				if (active != value) {
 					active = value;
 					changed = true;
+					Interlocked.Increment(ref generationRevision);
 					if (active)
 						LayerManager.instance.AddTopDependency(this);
 				}
@@ -73,15 +78,22 @@ namespace Runevision.LayerProcGen {
 			GridBounds oldIndices = chunkIndices;
 			GridBounds bounds = new GridBounds(focus - size / 2, size);
 			chunkIndices = bounds.GetDivided(layer.chunkSize);
-			if (chunkIndices != oldIndices || !isActive)
+			if (chunkIndices != oldIndices || !isActive) {
 				changed = true;
+				Interlocked.Increment(ref generationRevision);
+			}
 			isActive = true;
 		}
 
-		internal void GetPendingBounds(out GridBounds bounds, out int level) {
+		internal void GetPendingBounds(out GridBounds bounds, out int level, out int revision) {
 			changed = false;
 			bounds = new GridBounds(focus - size / 2, size);
 			level = this.level;
+			revision = Volatile.Read(ref generationRevision);
+		}
+
+		internal bool IsGenerationCurrent(int revision) {
+			return isActive && Volatile.Read(ref generationRevision) == revision;
 		}
 	}
 

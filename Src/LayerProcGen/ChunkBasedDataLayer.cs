@@ -11,6 +11,7 @@ using Runevision.SaveState;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Runevision.LayerProcGen {
@@ -56,7 +57,7 @@ namespace Runevision.LayerProcGen {
 
 		internal abstract void RemoveChunkLevel(Point index, int level);
 
-		internal abstract void EnsureLoadedInBounds(GridBounds bounds, int level, ChunkLevelData levelData);
+		internal abstract bool EnsureLoadedInBounds(GridBounds bounds, int level, ChunkLevelData levelData, Func<bool> isCancelled);
 	}
 
 	/// <summary>
@@ -137,12 +138,17 @@ namespace Runevision.LayerProcGen {
 			return (chunk != null && chunk.level >= level);
 		}
 
-		void CreateAndRegisterChunk(C chunk, int level) {
+		bool CreateAndRegisterChunk(C chunk, int level, Func<bool> isCancelled) {
 			ChunkLevelData levelData = ObjectPool<ChunkLevelData>.GlobalGet();
-			EnsureChunkProviders(chunk.index, level, levelData);
+			if (!EnsureChunkProviders(chunk.index, level, levelData, isCancelled)) {
+				ReleaseProviders(ref levelData);
+				return false;
+			}
 
-			if (LayerManager.instance.aborting)
-				return;
+			if (LayerManager.instance.aborting || isCancelled()) {
+				ReleaseProviders(ref levelData);
+				return false;
+			}
 
 			var ph = SimpleProfiler.Begin($"{GetType().Name} {level} Chunk");
 
@@ -157,6 +163,7 @@ namespace Runevision.LayerProcGen {
 				}
 			}
 			SimpleProfiler.End(ph);
+			return true;
 		}
 
 		internal sealed override void RemoveChunkLevel(Point index, int level) {
@@ -189,35 +196,44 @@ namespace Runevision.LayerProcGen {
 			}
 		}
 
-		void EnsureChunkProviders(Point index, int level, ChunkLevelData levelData) {
+		bool EnsureChunkProviders(Point index, int level, ChunkLevelData levelData, Func<bool> isCancelled) {
 			GridBounds chunkBounds = new GridBounds(index.x * chunkW, index.y * chunkH, chunkW, chunkH);
 
 			// Internal dependency on lower level of own layer.
 			if (level > 0) {
 				GridBounds requiredBoundsInternal = chunkBounds;
 				requiredBoundsInternal.Expand(1, 1, 1, 1);
-				EnsureLoadedInBounds(requiredBoundsInternal, level - 1, levelData);
+				if (!EnsureLoadedInBounds(requiredBoundsInternal, level - 1, levelData, isCancelled))
+					return false;
 			}
 
 			// External dependencies on other layers.
 			foreach (LayerDependency dependency in dependencies[level]) {
 				GridBounds requiredBounds = chunkBounds;
 				requiredBounds.Expand(dependency.hPadding, dependency.hPadding, dependency.vPadding, dependency.vPadding);
-				dependency.layer.EnsureLoadedInBounds(requiredBounds, dependency.level, levelData);
+				if (!dependency.layer.EnsureLoadedInBounds(requiredBounds, dependency.level, levelData, isCancelled))
+					return false;
 			}
+
+			return !isCancelled();
 		}
 
 		internal sealed override void ProcessTopDependency(TopLayerDependency dep) {
-			dep.GetPendingBounds(out GridBounds requiredBounds, out int requiredLevel);
+			dep.GetPendingBounds(out GridBounds requiredBounds, out int requiredLevel, out int revision);
 			ChunkLevelData oldRootUsage = dep.currentRootUsage;
+			Func<bool> isCancelled = () => LayerManager.instance.aborting || !dep.IsGenerationCurrent(revision);
 
 			if (dep.isActive) {
 				ChunkLevelData newRootUsage = ObjectPool<ChunkLevelData>.GlobalGet();
 
 				// Load according to new dependencies.
-				EnsureLoadedInBounds(requiredBounds, requiredLevel, newRootUsage);
-
-				dep.currentRootUsage = newRootUsage;
+				if (EnsureLoadedInBounds(requiredBounds, requiredLevel, newRootUsage, isCancelled)) {
+					dep.currentRootUsage = newRootUsage;
+				}
+				else {
+					ReleaseProviders(ref newRootUsage);
+					return;
+				}
 			}
 			else {
 				dep.currentRootUsage = null;
@@ -225,17 +241,19 @@ namespace Runevision.LayerProcGen {
 
 			if (oldRootUsage != null) {
 				// Release old dependencies.
-				foreach (ChunkLevelData.ProviderStruct provider in oldRootUsage.providers)
-					provider.chunk.DecrementUserCountOfLevel(provider.level);
-
-				// Remove old dependencies.
-				ObjectPool<ChunkLevelData>.GlobalReturn(ref oldRootUsage);
+				ReleaseProviders(ref oldRootUsage);
 			}
 		}
 
-		internal sealed override void EnsureLoadedInBounds(GridBounds bounds, int level, ChunkLevelData levelData) {
-			if (LayerManager.instance.aborting)
-				return;
+		static void ReleaseProviders(ref ChunkLevelData levelData) {
+			foreach (ChunkLevelData.ProviderStruct provider in levelData.providers)
+				provider.chunk.DecrementUserCountOfLevel(provider.level);
+			ObjectPool<ChunkLevelData>.GlobalReturn(ref levelData);
+		}
+
+		internal sealed override bool EnsureLoadedInBounds(GridBounds bounds, int level, ChunkLevelData levelData, Func<bool> isCancelled) {
+			if (LayerManager.instance.aborting || isCancelled())
+				return false;
 
 			// Load inside bounds.
 			GridBounds indices = bounds.GetDivided(new Point(chunkW, chunkH));
@@ -243,6 +261,8 @@ namespace Runevision.LayerProcGen {
 			List<Point> dependIndices = new List<Point>();
 			for (int x = indices.min.x; x < indices.max.x; x++) {
 				for (int y = indices.min.y; y < indices.max.y; y++) {
+					if (isCancelled())
+						return false;
 					Point index = new Point(x, y);
 					dependIndices.Add(index);
 					C chunk;
@@ -266,33 +286,42 @@ namespace Runevision.LayerProcGen {
 
 			if (!LayerManager.instance.useParallelThreads) {
 				foreach (C chunk in createChunks) {
-					CreateAndRegisterChunk(chunk, level);
+					if (isCancelled() || !CreateAndRegisterChunk(chunk, level, isCancelled))
+						return false;
 					WorkTracker.AddWorkDone(1, GetType());
 				}
 			}
 			else {
+				int cancelled = 0;
 				Parallel.ForEach(System.Collections.Concurrent.Partitioner.Create(createChunks),
 					chunk => {
-						if (LayerManager.instance.aborting)
+						if (LayerManager.instance.aborting || isCancelled()) {
+							Interlocked.Exchange(ref cancelled, 1);
 							return;
+						}
 						SimpleProfiler.BeginThread("Gen", $"{GetType().Name} {level} {chunk.index}");
 						lock (chunk.levelLocks[level]) {
 							if (chunk.level < level)
-								CreateAndRegisterChunk(chunk, level);
+								if (!CreateAndRegisterChunk(chunk, level, isCancelled))
+									Interlocked.Exchange(ref cancelled, 1);
 							WorkTracker.AddWorkDone(1, GetType());
 						}
 						SimpleProfiler.EndThread();
 					});
+				if (Volatile.Read(ref cancelled) != 0 || isCancelled())
+					return false;
 			}
 
-			if (LayerManager.instance.aborting)
-				return;
+			if (LayerManager.instance.aborting || isCancelled())
+				return false;
 
 			foreach (Point index in dependIndices) {
 				C chunk = chunks[index];
 				chunk.IncrementUserCountOfLevel(level);
 				levelData.providers.Add(new ChunkLevelData.ProviderStruct(chunk, level));
 			}
+
+			return true;
 		}
 
 		/// <summary>
