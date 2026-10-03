@@ -140,18 +140,17 @@ namespace Runevision.LayerProcGen {
 
 		bool CreateAndRegisterChunk(C chunk, int level, Func<bool> isCancelled) {
 			ChunkLevelData levelData = ObjectPool<ChunkLevelData>.GlobalGet();
+			try {
 			if (!EnsureChunkProviders(chunk.index, level, levelData, isCancelled)) {
-				ReleaseProviders(ref levelData);
 				return false;
 			}
 
 			if (LayerManager.instance.aborting || isCancelled()) {
-				ReleaseProviders(ref levelData);
 				return false;
 			}
 
 			var ph = SimpleProfiler.Begin($"{GetType().Name} {level} Chunk");
-
+			try {
 			if (chunk.level < level) {
 				if (chunk.level != level - 1)
 					Logg.LogError($"{chunk}: raising internal level from {chunk.level} to {level}");
@@ -160,10 +159,12 @@ namespace Runevision.LayerProcGen {
 				lock (chunks) {
 					chunk.level = level;
 					chunk.SetLevelData(levelData, level);
+					levelData = null; // provider ownership transferred to registered level
 				}
 			}
-			SimpleProfiler.End(ph);
+			} finally { SimpleProfiler.End(ph); }
 			return true;
+			} finally { if (levelData != null) ReleaseProviders(ref levelData); }
 		}
 
 		internal sealed override void RemoveChunkLevel(Point index, int level) {
@@ -225,7 +226,7 @@ namespace Runevision.LayerProcGen {
 
 			if (dep.isActive) {
 				ChunkLevelData newRootUsage = ObjectPool<ChunkLevelData>.GlobalGet();
-
+				try {
 				// Load according to new dependencies.
 				if (EnsureLoadedInBounds(requiredBounds, requiredLevel, newRootUsage, isCancelled)) {
 					dep.currentRootUsage = newRootUsage;
@@ -234,6 +235,7 @@ namespace Runevision.LayerProcGen {
 					ReleaseProviders(ref newRootUsage);
 					return;
 				}
+				} catch { ReleaseProviders(ref newRootUsage); throw; }
 			}
 			else {
 				dep.currentRootUsage = null;
@@ -246,9 +248,10 @@ namespace Runevision.LayerProcGen {
 		}
 
 		static void ReleaseProviders(ref ChunkLevelData levelData) {
-			foreach (ChunkLevelData.ProviderStruct provider in levelData.providers)
-				provider.chunk.DecrementUserCountOfLevel(provider.level);
-			ObjectPool<ChunkLevelData>.GlobalReturn(ref levelData);
+			// A sibling may have found these chunks but not yet registered its
+			// provider references. Reclaim only after the entire root job joins.
+			LayerManager.instance.DeferProviderRelease(levelData);
+			levelData = null;
 		}
 
 		internal sealed override bool EnsureLoadedInBounds(GridBounds bounds, int level, ChunkLevelData levelData, Func<bool> isCancelled) {
@@ -300,13 +303,14 @@ namespace Runevision.LayerProcGen {
 							return;
 						}
 						SimpleProfiler.BeginThread("Gen", $"{GetType().Name} {level} {chunk.index}");
+						try {
 						lock (chunk.levelLocks[level]) {
 							if (chunk.level < level)
 								if (!CreateAndRegisterChunk(chunk, level, isCancelled))
 									Interlocked.Exchange(ref cancelled, 1);
 							WorkTracker.AddWorkDone(1, GetType());
 						}
-						SimpleProfiler.EndThread();
+						} finally { SimpleProfiler.EndThread(); }
 					});
 				if (Volatile.Read(ref cancelled) != 0 || isCancelled())
 					return false;

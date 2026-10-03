@@ -28,10 +28,13 @@ namespace Runevision.LayerProcGen {
 		// completely processed. Consumers can use this to stage large requests
 		// without guessing whether the background worker has observed a change.
 		int completedGenerationPasses;
+		readonly System.Threading.Tasks.TaskCompletionSource<Exception> failure = new(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+		public System.Threading.Tasks.Task<Exception> Failure => failure.Task;
 		public int CompletedGenerationPasses { get { return Volatile.Read(ref completedGenerationPasses); } }
 
 		public event Action abort;
-		public bool aborting { get; private set; }
+		private volatile bool stopRequested;
+		public bool aborting { get { return stopRequested; } private set { stopRequested = value; } }
 
 		public List<TopLayerDependency> topDependencies { get; } = new List<TopLayerDependency>();
 		public void AddTopDependency(TopLayerDependency d) {
@@ -44,6 +47,19 @@ namespace Runevision.LayerProcGen {
 		}
 
 		Thread layerUpdateThread;
+		readonly System.Collections.Concurrent.ConcurrentQueue<ChunkLevelData> deferredProviderReleases = new();
+
+		internal void DeferProviderRelease(ChunkLevelData data) {
+			deferredProviderReleases.Enqueue(data);
+		}
+
+		void ReleaseJoinedProviders() {
+			while (deferredProviderReleases.TryDequeue(out var data)) {
+				foreach (var provider in data.providers)
+					provider.chunk.DecrementUserCountOfLevel(provider.level);
+				ObjectPool<ChunkLevelData>.GlobalReturn(ref data);
+			}
+		}
 
 		public LayerManager(bool useParallelThreads) {
 			instance = this;
@@ -66,6 +82,17 @@ namespace Runevision.LayerProcGen {
 
 		/// <summary>How long Unload waits for in-flight generation before abandoning it.</summary>
 		public static int unloadTimeoutMs = 5000;
+
+		/// <summary>Stop admitting work and join active jobs without resetting layer data.</summary>
+		public void Quiesce() {
+			aborting = true;
+			if (Thread.CurrentThread == layerUpdateThread)
+				throw new InvalidOperationException("Generation cannot join its own worker.");
+			layerUpdateThread.Join();
+			isGeneratingInBackground = false;
+			if (failure.Task.IsCompletedSuccessfully)
+				throw new InvalidOperationException("Generation worker failed; final save is unsafe.", failure.Task.Result);
+		}
 
 		public void Unload() {
 			aborting = true;
@@ -121,6 +148,7 @@ namespace Runevision.LayerProcGen {
 				}
 
 				if (changed) {
+					bool passCompleted = true;
 					var ph = SimpleProfiler.Begin("LayerManager Process", 1);
 
 					isGeneratingInBackground = true;
@@ -129,7 +157,21 @@ namespace Runevision.LayerProcGen {
 							TopLayerDependency dep = topDependencies[i];
 							// Generate to address changed top dependencies.
 							if (dep.changed) {
-								dep.abstractLayer.ProcessTopDependency(dep);
+								try {
+									try { dep.abstractLayer.ProcessTopDependency(dep); }
+									finally { ReleaseJoinedProviders(); }
+								}
+								catch (Exception error) {
+									passCompleted = false;
+									var errors = error is AggregateException aggregate ? aggregate.Flatten().InnerExceptions.ToArray() : new[] { error };
+									if (errors.All(e => e is OperationCanceledException || e is RetryableGenerationException)) {
+										dep.RetryGeneration();
+									} else {
+										failure.TrySetResult(error);
+										aborting = true;
+									}
+									break;
+								}
 								WorkTracker.WorkIsKnown(dep.layer.GetType());
 
 								// Remove inactive top dependencies.
@@ -141,7 +183,8 @@ namespace Runevision.LayerProcGen {
 					}
 
 					SimpleProfiler.End(ph);
-					Interlocked.Increment(ref completedGenerationPasses);
+					if (passCompleted) Interlocked.Increment(ref completedGenerationPasses);
+					else if (!aborting) Thread.Sleep(50);
 
 					if (SimpleProfiler.AnyCurrent())
 						SimpleProfiler.Log();
@@ -163,6 +206,11 @@ namespace Runevision.LayerProcGen {
 				}
 			}
 		}
+	}
+
+	/// <summary>Only throw when a failed stage has discarded all uncommitted mutations.</summary>
+	public sealed class RetryableGenerationException : Exception {
+		public RetryableGenerationException(string message, Exception inner) : base(message, inner) { }
 	}
 
 }

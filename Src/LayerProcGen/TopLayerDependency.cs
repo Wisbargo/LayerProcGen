@@ -95,6 +95,7 @@ namespace Runevision.LayerProcGen {
 		internal bool IsGenerationCurrent(int revision) {
 			return isActive && Volatile.Read(ref generationRevision) == revision;
 		}
+		internal void RetryGeneration() { changed = true; }
 	}
 
 }

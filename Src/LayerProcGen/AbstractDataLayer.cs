@@ -32,14 +32,19 @@ namespace Runevision.LayerProcGen {
 		public static IEnumerable<AbstractDataLayer> layers { get { return s_LayerDict.Values; } }
 
 		internal static void ResetInstances() {
-			foreach (var instance in s_LayerDict.Values)
+			foreach (var instance in s_LayerDict.Values) {
+				instance.OnReset();
 				instance.ResetInstance();
+			}
 			s_LayerDict.Clear();
 		}
 
 		// Pertaining to one layer.
 
 		internal abstract void ResetInstance();
+
+		/// <summary>Release external ownership even when shutdown abandoned an active worker.</summary>
+		protected virtual void OnReset() { }
 
 		internal AbstractDataLayer() {
 			if (s_LayerDict.ContainsKey(GetType()))
