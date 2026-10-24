@@ -53,7 +53,7 @@ namespace Runevision.LayerProcGen {
 
 		internal AbstractChunkBasedDataLayer() { }
 
-		internal abstract void ProcessTopDependency(TopLayerDependency dep);
+		internal abstract bool ProcessTopDependency(TopLayerDependency dep, out int revision);
 
 		internal abstract void RemoveChunkLevel(Point index, int level);
 
@@ -219,10 +219,12 @@ namespace Runevision.LayerProcGen {
 			return !isCancelled();
 		}
 
-		internal sealed override void ProcessTopDependency(TopLayerDependency dep) {
-			dep.GetPendingBounds(out GridBounds requiredBounds, out int requiredLevel, out int revision);
+		internal sealed override bool ProcessTopDependency(TopLayerDependency dep, out int revision) {
+			dep.GetPendingBounds(out GridBounds requiredBounds, out int requiredLevel, out revision);
+			int requestRevision = revision;
 			ChunkLevelData oldRootUsage = dep.currentRootUsage;
-			Func<bool> isCancelled = () => LayerManager.instance.aborting || !dep.IsGenerationCurrent(revision);
+			Func<bool> isCancelled = () => LayerManager.instance.aborting || !dep.IsGenerationCurrent(requestRevision)
+				|| (dep.Priority == GenerationPriority.Speculative && LayerManager.instance.ShouldYieldSpeculative);
 
 			if (dep.isActive) {
 				ChunkLevelData newRootUsage = ObjectPool<ChunkLevelData>.GlobalGet();
@@ -233,7 +235,7 @@ namespace Runevision.LayerProcGen {
 				}
 				else {
 					ReleaseProviders(ref newRootUsage);
-					return;
+					return false;
 				}
 				} catch { ReleaseProviders(ref newRootUsage); throw; }
 			}
@@ -245,6 +247,7 @@ namespace Runevision.LayerProcGen {
 				// Release old dependencies.
 				ReleaseProviders(ref oldRootUsage);
 			}
+			return true;
 		}
 
 		static void ReleaseProviders(ref ChunkLevelData levelData) {
@@ -287,7 +290,7 @@ namespace Runevision.LayerProcGen {
 			Point center = bounds.center;
 			createChunks = createChunks.OrderBy(chunk => (chunk.index * chunkSize - center).sqrMagnitude).ToList();
 
-			if (!LayerManager.instance.useParallelThreads) {
+			if (!LayerManager.instance.UseParallelForCurrentRequest) {
 				foreach (C chunk in createChunks) {
 					if (isCancelled() || !CreateAndRegisterChunk(chunk, level, isCancelled))
 						return false;

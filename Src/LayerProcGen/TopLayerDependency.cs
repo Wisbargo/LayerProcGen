@@ -9,93 +9,98 @@
 using Runevision.Common;
 
 namespace Runevision.LayerProcGen {
+    public enum GenerationPriority { Foreground, Speculative }
 
-	/// <summary>
-	/// All generation starts with one or more top level dependencies at the root.
-	/// </summary>
-	public class TopLayerDependency {
+    /// <summary>A foreground view or one bounded speculative root chunk.</summary>
+    public class TopLayerDependency {
+        readonly object requestGate = new();
+        public GenerationPriority Priority { get; }
+        public IChunkBasedDataLayer layer => (IChunkBasedDataLayer)abstractLayer;
+        public AbstractChunkBasedDataLayer abstractLayer { get; }
+        public int level { get; }
+        public Point focus { get; private set; }
+        public Point size { get; private set; }
+        public GridBounds chunkIndices { get; private set; }
+        volatile bool requestChanged;
+        public bool changed => requestChanged;
+        int generationRevision;
+        int completedRevision = -1;
+        public bool IsSettled => !requestChanged && Volatile.Read(ref completedRevision) == Volatile.Read(ref generationRevision);
+        internal ChunkLevelData currentRootUsage;
+        volatile bool active;
 
-		public IChunkBasedDataLayer layer { get { return (IChunkBasedDataLayer)abstractLayer; } }
-		public AbstractChunkBasedDataLayer abstractLayer { get; private set; }
-		public int level { get; private set; }
-		public Point focus { get; private set; }
-		public Point size { get; private set; }
-		public GridBounds chunkIndices { get; private set; }
-		public bool changed { get; private set; }
-		// A focus update can arrive while LayerManager is generating the prior bounds.
-		// The worker captures this value before starting and stops its now-obsolete
-		// request as soon as a chunk job reaches a cancellation check.
-		int generationRevision;
+        public bool isActive {
+            get => active;
+            set {
+                lock (requestGate) {
+                    if (active == value) return;
+                    if (value) ValidateSpeculativeBounds(focus, size);
+                    active = value;
+                    requestChanged = true;
+                    Interlocked.Increment(ref generationRevision);
+                }
+                if (value) LayerManager.instance.AddTopDependency(this);
+            }
+        }
 
-		internal ChunkLevelData currentRootUsage;
+        public TopLayerDependency(AbstractChunkBasedDataLayer layer, Point size, int level,
+            GenerationPriority priority = GenerationPriority.Foreground) {
+            abstractLayer = layer;
+            this.size = size;
+            this.level = level;
+            Priority = priority;
+        }
+        public TopLayerDependency(AbstractChunkBasedDataLayer layer, Point size)
+            : this(layer, size, layer.GetLevelCount() - 1) { }
+        public TopLayerDependency(AbstractChunkBasedDataLayer layer, Point size, GenerationPriority priority)
+            : this(layer, size, layer.GetLevelCount() - 1, priority) { }
 
-		bool active;
+        void ValidateSpeculativeBounds(Point nextFocus, Point nextSize) {
+            if (Priority != GenerationPriority.Speculative) return;
+            GridBounds indices = new GridBounds(nextFocus - nextSize / 2, nextSize).GetDivided(layer.chunkSize);
+            if (nextSize.x <= 0 || nextSize.y <= 0 || indices.size.x != 1 || indices.size.y != 1)
+                throw new ArgumentOutOfRangeException(nameof(nextSize), "Speculative requests must cover exactly one root chunk.");
+        }
 
-		public bool isActive {
-			get { return active; }
-			set {
-				if (active != value) {
-					active = value;
-					changed = true;
-					Interlocked.Increment(ref generationRevision);
-					if (active)
-						LayerManager.instance.AddTopDependency(this);
-				}
-			}
-		}
+        public void SetFocus(Point nextFocus) {
+            lock (requestGate) {
+                if (active && nextFocus == focus) return;
+                ValidateSpeculativeBounds(nextFocus, size);
+                focus = nextFocus;
+                UpdateLayerIndices();
+            }
+            LayerManager.instance.AddTopDependency(this);
+        }
+        public void SetSize(Point nextSize) {
+            lock (requestGate) {
+                if (active && nextSize == size) return;
+                ValidateSpeculativeBounds(focus, nextSize);
+                size = nextSize;
+                UpdateLayerIndices();
+            }
+            LayerManager.instance.AddTopDependency(this);
+        }
+        public void SetPadding(Point padding) => SetSize(padding * 2);
 
-		public TopLayerDependency(AbstractChunkBasedDataLayer layer, Point size, int level) {
-			abstractLayer = layer;
-			this.size = size;
-			this.level = level;
-		}
-
-		public TopLayerDependency(AbstractChunkBasedDataLayer layer, Point size)
-			: this(layer, size, layer.GetLevelCount() - 1) { }
-
-		public void SetFocus(Point focus) {
-			if (isActive && focus == this.focus)
-				return;
-			this.focus = focus;
-			UpdateLayerIndices();
-		}
-
-		public void SetSize(Point size) {
-			if (isActive && size == this.size)
-				return;
-			this.size = size;
-			UpdateLayerIndices();
-		}
-
-		public void SetPadding(Point padding) {
-			if (isActive && padding * 2 == size)
-				return;
-			size = padding * 2;
-			UpdateLayerIndices();
-		}
-
-		void UpdateLayerIndices() {
-			GridBounds oldIndices = chunkIndices;
-			GridBounds bounds = new GridBounds(focus - size / 2, size);
-			chunkIndices = bounds.GetDivided(layer.chunkSize);
-			if (chunkIndices != oldIndices || !isActive) {
-				changed = true;
-				Interlocked.Increment(ref generationRevision);
-			}
-			isActive = true;
-		}
-
-		internal void GetPendingBounds(out GridBounds bounds, out int level, out int revision) {
-			changed = false;
-			bounds = new GridBounds(focus - size / 2, size);
-			level = this.level;
-			revision = Volatile.Read(ref generationRevision);
-		}
-
-		internal bool IsGenerationCurrent(int revision) {
-			return isActive && Volatile.Read(ref generationRevision) == revision;
-		}
-		internal void RetryGeneration() { changed = true; }
-	}
-
+        void UpdateLayerIndices() {
+            GridBounds oldIndices = chunkIndices;
+            chunkIndices = new GridBounds(focus - size / 2, size).GetDivided(layer.chunkSize);
+            if (chunkIndices != oldIndices || !active) {
+                Interlocked.Increment(ref generationRevision);
+                requestChanged = true;
+            }
+            active = true;
+        }
+        internal void GetPendingBounds(out GridBounds bounds, out int requestedLevel, out int revision) {
+            lock (requestGate) {
+                requestChanged = false;
+                bounds = new GridBounds(focus - size / 2, size);
+                requestedLevel = level;
+                revision = Volatile.Read(ref generationRevision);
+            }
+        }
+        internal bool IsGenerationCurrent(int revision) => active && Volatile.Read(ref generationRevision) == revision;
+        internal void MarkCompleted(int revision) => Volatile.Write(ref completedRevision, revision);
+        internal void RetryGeneration() { requestChanged = true; }
+    }
 }
