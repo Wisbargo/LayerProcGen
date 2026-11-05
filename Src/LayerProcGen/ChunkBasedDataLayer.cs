@@ -187,6 +187,9 @@ namespace Runevision.LayerProcGen {
 				foreach (ChunkLevelData.ProviderStruct provider in levelData.providers)
 					provider.chunk.DecrementUserCountOfLevel(provider.level);
 
+				// A lower level may keep this chunk resident. Detach the retired
+				// slot before its data can be reused by another chunk through the pool.
+				chunk.SetLevelData(null, level);
 				ObjectPool<ChunkLevelData>.GlobalReturn(ref levelData);
 
 				if (level == 0)
