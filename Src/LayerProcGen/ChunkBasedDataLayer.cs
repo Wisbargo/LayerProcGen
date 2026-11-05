@@ -51,6 +51,9 @@ namespace Runevision.LayerProcGen {
 		/// </summary>
 		public virtual int GetLevelCount() { return 1; }
 
+		/// <summary>Controls this layer's loop only; provider layers choose independently.</summary>
+		public virtual int MaxGenerationParallelism => -1;
+
 		internal AbstractChunkBasedDataLayer() { }
 
 		internal abstract bool ProcessTopDependency(TopLayerDependency dep, out int revision);
@@ -303,6 +306,7 @@ namespace Runevision.LayerProcGen {
 			else {
 				int cancelled = 0;
 				Parallel.ForEach(System.Collections.Concurrent.Partitioner.Create(createChunks),
+					new ParallelOptions { MaxDegreeOfParallelism = MaxGenerationParallelism },
 					chunk => {
 						if (LayerManager.instance.aborting || isCancelled()) {
 							Interlocked.Exchange(ref cancelled, 1);
