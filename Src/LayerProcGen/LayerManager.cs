@@ -222,6 +222,12 @@ namespace Runevision.LayerProcGen {
                         aborting = true;
                     }
                 } finally {
+                    // Give waiting requests of the same priority a turn even
+                    // when this view moved (or a retry was requested) mid-pass.
+                    // Selection still gives foreground work strict precedence.
+                    lock (topDependencies) {
+                        if (topDependencies.Remove(dependency)) topDependencies.Add(dependency);
+                    }
                     long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - started;
                     Interlocked.Add(ref requestTicks, elapsed);
                     // While an uninterruptible speculative plugin finishes, this is
