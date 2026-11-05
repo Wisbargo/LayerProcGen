@@ -28,6 +28,7 @@ namespace Runevision.LayerProcGen {
         internal bool UseParallelForCurrentRequest => useParallelThreads
             && Volatile.Read(ref activePriority) == (int)GenerationPriority.Foreground;
         long admittedRequests, completedRequests, interruptedRequests, requestTicks, foregroundWaitTicks;
+        long yieldedRequests, exceptionRequests;
         int runningRequests;
         public GenerationSchedulerSnapshot SchedulerSnapshot {
             get {
@@ -40,7 +41,10 @@ namespace Runevision.LayerProcGen {
                         Interlocked.Read(ref requestTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
                         Interlocked.Read(ref foregroundWaitTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
                         Volatile.Read(ref runningRequests) != 0
-                            && Volatile.Read(ref activePriority) == (int)GenerationPriority.Foreground);
+                            && Volatile.Read(ref activePriority) == (int)GenerationPriority.Foreground) {
+                        Yielded = Interlocked.Read(ref yieldedRequests),
+                        ExceptionInterrupted = Interlocked.Read(ref exceptionRequests)
+                    };
                 }
             }
         }
@@ -208,9 +212,11 @@ namespace Runevision.LayerProcGen {
                         // Preemption leaves prior root ownership intact and retries
                         // after newly arrived foreground work. It is not a completed pass.
                         dependency.RetryGeneration();
+                        Interlocked.Increment(ref yieldedRequests);
                         Interlocked.Increment(ref interruptedRequests);
                     }
                 } catch (Exception error) {
+                    Interlocked.Increment(ref exceptionRequests);
                     Interlocked.Increment(ref interruptedRequests);
                     var errors = error is AggregateException aggregate
                         ? aggregate.Flatten().InnerExceptions.ToArray() : new[] { error };
@@ -247,7 +253,12 @@ namespace Runevision.LayerProcGen {
 	/// <summary>Root admission counts; active dependency halos are not individual root requests.</summary>
     public readonly record struct GenerationSchedulerSnapshot(int PendingForeground, int PendingSpeculative,
         int Running, long Admitted, long Completed, long Interrupted, double ExecutionMs,
-        double ForegroundBlockingUpperBoundMs, bool RunningForeground);
+        double ForegroundBlockingUpperBoundMs, bool RunningForeground) {
+        // ProcessTopDependency returning false includes supersession, preemption
+        // and shutdown. Exception exits include fatal errors, not just retries.
+        public long Yielded { get; init; }
+        public long ExceptionInterrupted { get; init; }
+    }
 
     /// <summary>Only throw when a failed stage has discarded all uncommitted mutations.</summary>
 	public sealed class RetryableGenerationException : Exception {
